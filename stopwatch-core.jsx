@@ -2,6 +2,8 @@
 // Shared state + formatting + Gun.js real-time P2P sync.
 
 const STORE_KEY = 'multi-stopwatch:v1';
+// Unique per page-load — used to filter out our own Gun echoes
+const _SESSION_ID = Math.random().toString(36).slice(2, 10);
 
 // ─── Formatting ───────────────────────────────────────────────
 function fmt(ms) {
@@ -151,15 +153,16 @@ function useStopwatchStore(roomCode = null) {
   });
 
   // Updated every render — always has the correct roomCode in its closure.
-  const persistRef   = React.useRef(() => {});
-  const lastWriteTs  = React.useRef(0);
+  const persistRef = React.useRef(() => {});
 
   persistRef.current = (next) => {
     try { localStorage.setItem(STORE_KEY, JSON.stringify(next)); } catch {}
     if (roomCode && window._gun) {
-      const ts = Date.now();
-      lastWriteTs.current = ts;
-      window._gun.get('mswv1').get(roomCode).put({ payload: JSON.stringify(next), ts });
+      window._gun.get('mswv1').get(roomCode).put({
+        payload: JSON.stringify(next),
+        ts: Date.now(),
+        from: _SESSION_ID,
+      });
     }
   };
 
@@ -175,9 +178,7 @@ function useStopwatchStore(roomCode = null) {
         // Room is empty — push our local state so other devices see it.
         if (!data || !data.payload) {
           setState(prev => {
-            const ts = Date.now();
-            lastWriteTs.current = ts;
-            node.put({ payload: JSON.stringify(prev), ts });
+            node.put({ payload: JSON.stringify(prev), ts: Date.now(), from: _SESSION_ID });
             return prev;
           });
           return;
@@ -187,7 +188,7 @@ function useStopwatchStore(roomCode = null) {
       if (!data || !data.payload) return;
 
       // Ignore echoes of our own writes (Gun always echoes them back).
-      if (data.ts && data.ts <= lastWriteTs.current) return;
+      if (data.from === _SESSION_ID) return;
 
       try {
         const parsed = normalizeState(JSON.parse(data.payload));
