@@ -298,10 +298,21 @@ function useIdleStore(anyRunning) {
       const inWindow  = now >= winStart && now < winEnd;
       const shouldRun = inWindow && !anyRunning;
       const isRunning = !!timer.startedAt;
+      const todayStr  = localDateStr(now);
 
       if (shouldRun && !isRunning) {
-        // Start idle
-        doUpdate(s => ({ ...s, timer: { ...s.timer, startedAt: now } }));
+        // Start idle — backfill to window start if the app was opened late.
+        // Find the latest session end today so we don't overlap existing sessions.
+        const todaySessions = (timer.sessions || []).filter(
+          sess => localDateStr(sess.startedAt) === todayStr || localDateStr(sess.endedAt) === todayStr
+        );
+        let backfillStart = winStart;
+        for (const sess of todaySessions) {
+          if (sess.endedAt > backfillStart && sess.endedAt <= now) {
+            backfillStart = sess.endedAt;
+          }
+        }
+        doUpdate(s => ({ ...s, timer: { ...s.timer, startedAt: backfillStart } }));
       } else if (!shouldRun && isRunning) {
         // Stop idle — cap end at window end if we've passed it
         const endAt = (!inWindow && now > winEnd) ? winEnd : now;
@@ -316,6 +327,32 @@ function useIdleStore(anyRunning) {
             }],
           },
         }));
+      } else if (!inWindow && now > winEnd && !isRunning) {
+        // Window already ended for today — retroactively credit any missed idle time.
+        // (Happens when the app is first opened after the window has closed.)
+        const todaySessions = (timer.sessions || []).filter(
+          sess => localDateStr(sess.startedAt) === todayStr || localDateStr(sess.endedAt) === todayStr
+        );
+        // Start the retroactive session from winStart, bumped past any existing sessions.
+        let retroStart = winStart;
+        for (const sess of todaySessions) {
+          if (sess.endedAt > retroStart && sess.endedAt <= winEnd) {
+            retroStart = sess.endedAt;
+          }
+        }
+        // Only write if there is genuinely uncounted idle time left in the window.
+        if (retroStart < winEnd) {
+          doUpdate(s => ({
+            ...s,
+            timer: {
+              ...s.timer,
+              sessions: [...s.timer.sessions, {
+                startedAt: retroStart,
+                endedAt: winEnd,
+              }],
+            },
+          }));
+        }
       }
     };
 
