@@ -219,6 +219,24 @@ function idleElapsedToday(idleTimer, now) {
   return byDay.get(today).reduce((a, s) => a + s.ms, 0);
 }
 
+// ─── Idle gap computation ─────────────────────────────────────
+// Given a window [wStart, wEnd] and an array of {start, end} covered ranges,
+// returns the uncovered gaps as [{startedAt, endedAt}].
+function computeIdleGaps(wStart, wEnd, coveredRanges) {
+  const sorted = coveredRanges
+    .filter(r => r.end > wStart && r.start < wEnd)
+    .map(r => ({ start: Math.max(r.start, wStart), end: Math.min(r.end, wEnd) }))
+    .sort((a, b) => a.start - b.start);
+  const gaps = [];
+  let cursor = wStart;
+  for (const r of sorted) {
+    if (r.start > cursor) gaps.push({ startedAt: cursor, endedAt: r.start });
+    cursor = Math.max(cursor, r.end);
+  }
+  if (cursor < wEnd) gaps.push({ startedAt: cursor, endedAt: wEnd });
+  return gaps;
+}
+
 // ─── Idle Timer Store ─────────────────────────────────────────
 // Automatically tracks "not working" time within a user-set daily window.
 // Stops whenever any regular stopwatch is running; resumes when all stop.
@@ -232,7 +250,7 @@ const DEFAULT_IDLE_SETTINGS = {
   effectiveDate: '', // date string when current settings were last promoted
 };
 
-function useIdleStore(anyRunning) {
+function useIdleStore(anyRunning, workingTimers = []) {
   const [idleState, setIdleState] = React.useState(() => {
     try {
       const raw = localStorage.getItem(IDLE_STORE_KEY);
@@ -249,6 +267,10 @@ function useIdleStore(anyRunning) {
 
   const stateRef = React.useRef(idleState);
   stateRef.current = idleState;
+
+  // Keep a ref to workingTimers so the effect doesn't re-run on every render
+  const workingTimersRef = React.useRef(workingTimers);
+  workingTimersRef.current = workingTimers;
 
   // doUpdate is stable — setIdleState is a stable ref from useState
   const doUpdate = React.useCallback((fn) => {
@@ -298,59 +320,65 @@ function useIdleStore(anyRunning) {
       const inWindow  = now >= winStart && now < winEnd;
       const shouldRun = inWindow && !anyRunning;
       const isRunning = !!timer.startedAt;
-      const todayStr  = localDateStr(now);
+
+      // All ranges that are NOT idle: existing idle sessions + working timer sessions.
+      // Using workingTimersRef so this never causes the effect to re-run.
+      const getCovered = (upTo) => {
+        const ranges = [];
+        for (const sess of (timer.sessions || [])) {
+          ranges.push({ start: sess.startedAt, end: sess.endedAt });
+        }
+        for (const wt of workingTimersRef.current) {
+          for (const sess of (wt.sessions || [])) {
+            ranges.push({ start: sess.startedAt, end: sess.endedAt });
+          }
+          if (wt.startedAt) ranges.push({ start: wt.startedAt, end: upTo });
+        }
+        return ranges;
+      };
 
       if (shouldRun && !isRunning) {
-        // Start idle — backfill to window start if the app was opened late.
-        // Find the latest session end today so we don't overlap existing sessions.
-        const todaySessions = (timer.sessions || []).filter(
-          sess => localDateStr(sess.startedAt) === todayStr || localDateStr(sess.endedAt) === todayStr
-        );
-        let backfillStart = winStart;
-        for (const sess of todaySessions) {
-          if (sess.endedAt > backfillStart && sess.endedAt <= now) {
-            backfillStart = sess.endedAt;
-          }
+        // Idle should start. Backfill from winStart minus any working time,
+        // so working sessions are never counted as idle.
+        const gaps = computeIdleGaps(winStart, now, getCovered(now));
+        if (gaps.length === 0) {
+          // All time already covered — start fresh from now
+          doUpdate(s => ({ ...s, timer: { ...s.timer, startedAt: now } }));
+        } else if (gaps.length === 1) {
+          // Single continuous idle gap — use as the live session
+          doUpdate(s => ({ ...s, timer: { ...s.timer, startedAt: gaps[0].startedAt } }));
+        } else {
+          // Multiple gaps (worked in between) — save earlier ones, live = last gap
+          const past = gaps.slice(0, -1);
+          const live = gaps[gaps.length - 1];
+          doUpdate(s => ({
+            ...s,
+            timer: {
+              ...s.timer,
+              startedAt: live.startedAt,
+              sessions: [...s.timer.sessions, ...past],
+            },
+          }));
         }
-        doUpdate(s => ({ ...s, timer: { ...s.timer, startedAt: backfillStart } }));
       } else if (!shouldRun && isRunning) {
-        // Stop idle — cap end at window end if we've passed it
+        // Stop idle — cap end at window end if we've already passed it
         const endAt = (!inWindow && now > winEnd) ? winEnd : now;
         doUpdate(s => ({
           ...s,
           timer: {
             ...s.timer,
             startedAt: null,
-            sessions: [...s.timer.sessions, {
-              startedAt: s.timer.startedAt,
-              endedAt: endAt,
-            }],
+            sessions: [...s.timer.sessions, { startedAt: s.timer.startedAt, endedAt: endAt }],
           },
         }));
       } else if (!inWindow && now > winEnd && !isRunning) {
-        // Window already ended for today — retroactively credit any missed idle time.
-        // (Happens when the app is first opened after the window has closed.)
-        const todaySessions = (timer.sessions || []).filter(
-          sess => localDateStr(sess.startedAt) === todayStr || localDateStr(sess.endedAt) === todayStr
-        );
-        // Start the retroactive session from winStart, bumped past any existing sessions.
-        let retroStart = winStart;
-        for (const sess of todaySessions) {
-          if (sess.endedAt > retroStart && sess.endedAt <= winEnd) {
-            retroStart = sess.endedAt;
-          }
-        }
-        // Only write if there is genuinely uncounted idle time left in the window.
-        if (retroStart < winEnd) {
+        // Window already closed — retroactively fill idle gaps, subtracting
+        // working sessions so working time is never double-counted.
+        const gaps = computeIdleGaps(winStart, winEnd, getCovered(winEnd));
+        if (gaps.length > 0) {
           doUpdate(s => ({
             ...s,
-            timer: {
-              ...s.timer,
-              sessions: [...s.timer.sessions, {
-                startedAt: retroStart,
-                endedAt: winEnd,
-              }],
-            },
+            timer: { ...s.timer, sessions: [...s.timer.sessions, ...gaps] },
           }));
         }
       }
@@ -387,3 +415,4 @@ Object.assign(window, {
   localDateStr, getSessionsByDay, fmtWallTime, fmtDateLabel,
   DEFAULT_IDLE_SETTINGS,
 });
+
