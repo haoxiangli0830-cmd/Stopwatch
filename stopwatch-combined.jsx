@@ -370,7 +370,7 @@ function GlobalLogView({ timers, idleTimer, now, onBack }) {
 function VariationCombined() {
   const [state, api]         = useStopwatchStore();
   const anyRunning           = state.timers.some(t => t.startedAt);
-  const [idleState, idleApi] = useIdleStore(anyRunning);
+  const [idleState, idleApi] = useIdleStore(anyRunning, state.timers);
   // RAF loop runs when any timer or the idle timer is ticking
   const anyActive = anyRunning || !!idleState.timer.startedAt;
   const now = useNow(anyActive);
@@ -640,3 +640,4 @@ function VariationCombined() {
 }
 
 Object.assign(window, { VariationCombined });
+
